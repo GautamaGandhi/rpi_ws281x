@@ -27,8 +27,12 @@
  *
  */
 
-
-static char VERSION[] = "XX.YY.ZZ";
+ /*
+ *	Name: main.c
+ *  Desctiption: This file demonstrates the use of mmap to map physical addresses of hardware peripheral registers
+ *  			 to the virtual address space of the process. This capability has been used to test the PWM functionality.
+ *
+ */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -43,149 +47,313 @@ static char VERSION[] = "XX.YY.ZZ";
 #include <stdarg.h>
 #include <getopt.h>
 
-
 #include "clk.h"
 #include "gpio.h"
 #include "dma.h"
 #include "pwm.h"
 #include "version.h"
+#include "rpihw.h"
+#include "mailbox.h"
 
 #include "ws2811.h"
 
+#define DEV_MEM "/dev/mem" // Device memory 
+#define OSC_FREQ 19200000 // Raspberry Pi frequency
+#define OSC_FREQ_PI4 54000000 // Raspberry Pi 4 frequency
 
-#define ARRAY_SIZE(stuff)       (sizeof(stuff) / sizeof(stuff[0]))
+// Structure to hold device pointers
+typedef struct {
+	// Pointer to Raspberry Pi hardware information
+	const rpi_hw_t *rpi_hw;
 
-// defaults for cmdline options
-#define TARGET_FREQ             WS2811_TARGET_FREQ
-#define GPIO_PIN                18
-#define DMA                     10
-//#define STRIP_TYPE            WS2811_STRIP_RGB		// WS2812/SK6812RGB integrated chip+leds
-#define STRIP_TYPE              WS2811_STRIP_GBR		// WS2812/SK6812RGB integrated chip+leds
-//#define STRIP_TYPE            SK6812_STRIP_RGBW		// SK6812RGBW (NOT SK6812RGB)
+	// Pointers to structures that are mapped to Physical registers
+	volatile pwm_t *pwm;
+	volatile gpio_t *gpio;
+	volatile cm_clk_t *cm_clk;
+} test_device_t;
 
-#define WIDTH                   8
-#define HEIGHT                  8
-#define LED_COUNT               (WIDTH * HEIGHT)
+// Enum for duty_cycle
+typedef enum {
+	INCREASE,
+	DECREASE,
+} duty_cycle_change_t;
 
-int width = WIDTH;
-int height = HEIGHT;
-int led_count = LED_COUNT;
+// Variables to store the GPIO, Channel and Duty cycle parameters received from the command line
+int gpio_num;
+int channel_num;
+int duty_cycle;
 
-int clear_on_exit = 0;
+// Flags to check if command line parameters have been provided
+int gpio_flag = 0;
+int channel_flag = 0;
+int duty_cycle_flag = 0;
 
-ws2811_t ledstring =
+uint32_t running = 1; // Running flag
+
+// Function declarations
+void print_usage();
+int map_registers_pwm(test_device_t *test_device);
+int unmap_registers_pwm(test_device_t *test_device);
+int check_pin_setup(test_device_t *test_device);
+void pwm_register_config(test_device_t *test_device);
+void set_pwm_max(test_device_t *test_device, uint32_t range);
+void enable_pwm(test_device_t *test_device);
+void disble_pwm(test_device_t *test_device);
+void pwm_set_duty_cycle(test_device_t *test_device);
+void pwm_duty_cycle_change(test_device_t *test_device, int percentage, duty_cycle_change_t change);
+
+
+// Function to parse arguments
+void parse_args(int argc, char **argv)
 {
-    .freq = TARGET_FREQ,
-    .dmanum = DMA,
-    .channel =
+	// Short options string
+    const char *short_options = "h";
+    
+    // Options struct containing user defined long options "name" and "alg"
+    static struct option long_options[] =
     {
-        [0] =
-        {
-            .gpionum = GPIO_PIN,
-            .invert = 0,
-            .count = LED_COUNT,
-            .strip_type = STRIP_TYPE,
-            .brightness = 255,
-        },
-        [1] =
-        {
-            .gpionum = 0,
-            .invert = 0,
-            .count = 0,
-            .brightness = 0,
-        },
-    },
-};
+		{"gpio", required_argument, NULL, 'g'},
+		{"channel", required_argument, NULL, 'c'},
+		{"duty_cycle", required_argument, NULL, 'd'},
+        {0, 0, 0, 0}
+    };
 
-ws2811_led_t *matrix;
+	int ch;
 
-static uint8_t running = 1;
+	// Local variables for GPIO, Channel and duty_cycle
+	int gpio, channel, d_cycle;
 
-void matrix_render(void)
-{
-    int x, y;
-
-    for (x = 0; x < width; x++)
-    {
-        for (y = 0; y < height; y++)
-        {
-            ledstring.channel[0].leds[(y * width) + x] = matrix[y * width + x];
-        }
+	printf("Test\n");
+    
+    // Iterating until getopt_long() returns -1
+    while ((ch = getopt_long(argc, argv, short_options, long_options, NULL )) != -1) {
+      switch (ch) {
+		case 'g':
+			gpio_flag = 1;
+			gpio = atoi(optarg);
+            break;
+		case 'd':
+			duty_cycle_flag = 1;
+			d_cycle = atoi(optarg);
+            break;			
+		case 'c':
+			channel_flag = 1;
+			channel = atoi(optarg);
+            break;
+		case 'h':
+			print_usage();
+            break;
+          case '?':
+              /* getopt_long already printed an error message. */
+              break;
+          default:
+              break;
+      }
     }
+
+	// Checking if the gpio flag was set
+	if (gpio_flag) {
+		gpio_num = gpio;
+	} else {
+		gpio_num = 18; // Default pin number is 18
+	}
+
+	// Checking if the channel flag was set
+	if (channel_flag) {
+		channel_num = channel;
+	} else {
+		channel_num = 0; // Default channel number is 0
+	}
+
+	// Checking if the duty cycle flag was set
+	if (duty_cycle_flag) {
+		duty_cycle = d_cycle;
+	} else {
+		duty_cycle = 50; // Default duty cycle is 50%
+	}
 }
 
-void matrix_raise(void)
+// This function is maps the hardware registers to enable PWM functionality
+int map_registers_pwm(test_device_t *test_device)
 {
-    int x, y;
+	uint32_t base = test_device->rpi_hw->periph_base;
+	// The mapmem function contains an mmap function call with parameters provided
+	test_device->pwm = mapmem(PWM_OFFSET + base, sizeof(pwm_t), DEV_MEM);
+	if (!test_device->pwm)
+	{
+		return -1;
+	}
 
-    for (y = 0; y < (height - 1); y++)
+	test_device->gpio = mapmem(GPIO_OFFSET + base, sizeof(gpio_t), DEV_MEM);
+    if (!test_device->gpio)
     {
-        for (x = 0; x < width; x++)
-        {
-            // This is for the 8x8 Pimoroni Unicorn-HAT where the LEDS in subsequent
-            // rows are arranged in opposite directions
-            matrix[y * width + x] = matrix[(y + 1)*width + width - x - 1];
-        }
+        return -1;
     }
+
+	test_device->cm_clk = mapmem(CM_PWM_OFFSET + base, sizeof(cm_clk_t), DEV_MEM);
+    if (!test_device->cm_clk)
+    {
+        return -1;
+    }
+	return 0;
 }
 
-void matrix_clear(void)
+// Function to unmap registers after their usage is complete
+int unmap_registers_pwm(test_device_t *test_device)
 {
-    int x, y;
+	if (test_device->pwm) {
+		unmapmem((void *)test_device->pwm, sizeof(pwm_t));
+	}
 
-    for (y = 0; y < (height ); y++)
-    {
-        for (x = 0; x < width; x++)
-        {
-            matrix[y * width + x] = 0;
-        }
-    }
+	if (test_device->gpio) {
+		unmapmem((void *)test_device->gpio, sizeof(gpio_t));
+	}
+
+	if (test_device->cm_clk) {
+		unmapmem((void *)test_device->cm_clk, sizeof(cm_clk_t));
+	}
 }
 
-int dotspos[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
-ws2811_led_t dotcolors[] =
+// Function to print the usage for this executable
+void print_usage()
 {
-    0x00200000,  // red
-    0x00201000,  // orange
-    0x00202000,  // yellow
-    0x00002000,  // green
-    0x00002020,  // lightblue
-    0x00000020,  // blue
-    0x00100010,  // purple
-    0x00200010,  // pink
-};
+	printf("The program execution is as follows:\n");
+	printf("./pwm_test --gpio=[GPIO Number] --channel=[Channel Number] --duty_cycle=[Duty Cycle] -h\n");
+}
 
-ws2811_led_t dotcolors_rgbw[] =
+// Function to check if the pin setup is valid based on the user inputs and sets the required GPIO functionality
+int check_pin_setup(test_device_t *test_device)
 {
-    0x00200000,  // red
-    0x10200000,  // red + W
-    0x00002000,  // green
-    0x10002000,  // green + W
-    0x00000020,  // blue
-    0x10000020,  // blue + W
-    0x00101010,  // white
-    0x10101010,  // white + W
+	int altnum = pwm_pin_alt(channel_num, gpio_num);
 
-};
+	if (altnum == -1) {
+		printf("Invalid GPIO or Channel Number\n");
+		return -1;
+	}
 
-void matrix_bottom(void)
+	gpio_function_set(test_device->gpio, gpio_num, altnum);
+	return 0;
+}
+
+// Configuration function that accesses registers and sets up the PWM
+void pwm_register_config(test_device_t *test_device)
 {
-    int i;
+	volatile pwm_t *pwm = test_device->pwm; 
+	volatile cm_clk_t *cm_clk = test_device->cm_clk;
 
-    for (i = 0; i < (int)(ARRAY_SIZE(dotspos)); i++)
-    {
-        dotspos[i]++;
-        if (dotspos[i] > (width - 1))
-        {
-            dotspos[i] = 0;
-        }
+	// Turn off the PWM in case already running
+    pwm->ctl = 0;
+    usleep(10);
 
-        if (ledstring.channel[0].strip_type == SK6812_STRIP_RGBW) {
-            matrix[dotspos[i] + (height - 1) * width] = dotcolors_rgbw[i];
-        } else {
-            matrix[dotspos[i] + (height - 1) * width] = dotcolors[i];
-        }
+    // Stopping the clock if its running
+    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_KILL;
+    usleep(10);
+    while (cm_clk->ctl & CM_CLK_CTL_BUSY);
+
+	uint32_t osc_freq = OSC_FREQ;
+
+    if(test_device->rpi_hw->type == RPI_HWVER_TYPE_PI4){
+        osc_freq = OSC_FREQ_PI4;
     }
+
+	// WS2811 frequency of 800kHz; reused for clock scaling
+    uint32_t freq = 800000;
+
+    // Setup the Clock - Use OSC @ 19.2Mhz w/ 3 clocks/tick
+    cm_clk->div = CM_CLK_DIV_PASSWD | CM_CLK_DIV_DIVI(osc_freq / (3 * freq));
+    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC;
+    cm_clk->ctl = CM_CLK_CTL_PASSWD | CM_CLK_CTL_SRC_OSC | CM_CLK_CTL_ENAB;
+    usleep(10);
+    while (!(cm_clk->ctl & CM_CLK_CTL_BUSY));
+}
+
+// Sets the maximum value for the PWM signal; this value is the basis for the duty cycle
+void set_pwm_max(test_device_t *test_device, uint32_t range)
+{
+	test_device->pwm->rng1 = range;
+	usleep(10);
+}
+
+// Enable pwm based on the channel number
+void enable_pwm(test_device_t *test_device)
+{
+	if (!channel_num)
+		test_device->pwm->ctl |= RPI_PWM_CTL_PWEN1;
+	else
+		test_device->pwm->ctl |= RPI_PWM_CTL_PWEN2;
+	usleep(10);
+}
+
+// Disable pwm based on the channel number
+void disable_pwm(test_device_t *test_device)
+{
+	if (!channel_num)
+		test_device->pwm->ctl &= ~RPI_PWM_CTL_PWEN1;
+	else
+		test_device->pwm->ctl &= ~RPI_PWM_CTL_PWEN2;
+	usleep(10);
+}
+
+// Setting the PWM duty cycle
+void pwm_set_duty_cycle(test_device_t *test_device)
+{
+	uint32_t range;
+	if (!channel_num) {
+		range = test_device->pwm->rng1;
+		test_device->pwm->dat1 = (range*duty_cycle)/100;
+	}
+	else {
+		range = test_device->pwm->rng2;
+		test_device->pwm->dat2 = (range*duty_cycle)/100;
+	}
+	usleep(10);
+}
+
+// Changing the PWM duty cycke based on the percentage and type of change provided
+void pwm_duty_cycle_change(test_device_t *test_device, int percentage, duty_cycle_change_t change)
+{
+	volatile pwm_t *pwm = test_device->pwm;
+	uint32_t range;
+	uint32_t data_register;
+	uint32_t current_duty_cycle;
+
+	// If channel 1 is enabled
+	if (pwm->ctl & RPI_PWM_CTL_PWEN1) {
+		range = pwm->rng1;
+		data_register = pwm->dat1;
+		current_duty_cycle = (data_register * 100)/range;
+		printf("Current duty cycle is %u\n", current_duty_cycle);
+		
+		uint32_t change_value = (percentage * range) / 100;
+
+		// Checking the type of change
+		if (change == INCREASE) {
+			// Checking if the current duty cycle will exceed the maximum value
+			if (data_register + change_value > range)
+				return;
+			pwm->dat1 += change_value;
+		}
+		else if (change == DECREASE){
+			// Checking if the current duty cycle will fall below the minimum value
+			if (data_register - change_value < 0)
+				return;
+			pwm->dat1 -= change_value;
+		}
+	}
+
+	// If channel 2 is enabled
+	if (pwm->ctl & RPI_PWM_CTL_PWEN2) {
+		range = pwm->rng2;
+		data_register = pwm->dat2;
+		current_duty_cycle = (data_register * 100)/range;
+		printf("Current duty cycle is %u\n", current_duty_cycle);
+		
+		uint32_t change_value = (percentage * range) / 100;
+		if (change == INCREASE)
+			pwm->dat2 += change_value;
+		else if (change == DECREASE)
+			pwm->dat2 -= change_value;
+	}
 }
 
 static void ctrl_c_handler(int signum)
@@ -205,215 +373,58 @@ static void setup_handlers(void)
     sigaction(SIGTERM, &sa, NULL);
 }
 
-
-void parseargs(int argc, char **argv, ws2811_t *ws2811)
-{
-	int index;
-	int c;
-
-	static struct option longopts[] =
-	{
-		{"help", no_argument, 0, 'h'},
-		{"dma", required_argument, 0, 'd'},
-		{"gpio", required_argument, 0, 'g'},
-		{"invert", no_argument, 0, 'i'},
-		{"clear", no_argument, 0, 'c'},
-		{"strip", required_argument, 0, 's'},
-		{"height", required_argument, 0, 'y'},
-		{"width", required_argument, 0, 'x'},
-		{"version", no_argument, 0, 'v'},
-		{0, 0, 0, 0}
-	};
-
-	while (1)
-	{
-
-		index = 0;
-		c = getopt_long(argc, argv, "cd:g:his:vx:y:", longopts, &index);
-
-		if (c == -1)
-			break;
-
-		switch (c)
-		{
-		case 0:
-			/* handle flag options (array's 3rd field non-0) */
-			break;
-
-		case 'h':
-			fprintf(stderr, "%s version %s\n", argv[0], VERSION);
-			fprintf(stderr, "Usage: %s \n"
-				"-h (--help)    - this information\n"
-				"-s (--strip)   - strip type - rgb, grb, gbr, rgbw\n"
-				"-x (--width)   - matrix width (default 8)\n"
-				"-y (--height)  - matrix height (default 8)\n"
-				"-d (--dma)     - dma channel to use (default 10)\n"
-				"-g (--gpio)    - GPIO to use\n"
-				"                 If omitted, default is 18 (PWM0)\n"
-				"-i (--invert)  - invert pin output (pulse LOW)\n"
-				"-c (--clear)   - clear matrix on exit.\n"
-				"-v (--version) - version information\n"
-				, argv[0]);
-			exit(-1);
-
-		case 'D':
-			break;
-
-		case 'g':
-			if (optarg) {
-				int gpio = atoi(optarg);
-/*
-	PWM0, which can be set to use GPIOs 12, 18, 40, and 52.
-	Only 12 (pin 32) and 18 (pin 12) are available on the B+/2B/3B
-	PWM1 which can be set to use GPIOs 13, 19, 41, 45 and 53.
-	Only 13 is available on the B+/2B/PiZero/3B, on pin 33
-	PCM_DOUT, which can be set to use GPIOs 21 and 31.
-	Only 21 is available on the B+/2B/PiZero/3B, on pin 40.
-	SPI0-MOSI is available on GPIOs 10 and 38.
-	Only GPIO 10 is available on all models.
-
-	The library checks if the specified gpio is available
-	on the specific model (from model B rev 1 till 3B)
-
-*/
-				ws2811->channel[0].gpionum = gpio;
-			}
-			break;
-
-		case 'i':
-			ws2811->channel[0].invert=1;
-			break;
-
-		case 'c':
-			clear_on_exit=1;
-			break;
-
-		case 'd':
-			if (optarg) {
-				int dma = atoi(optarg);
-				if (dma < 14) {
-					ws2811->dmanum = dma;
-				} else {
-					printf ("invalid dma %d\n", dma);
-					exit (-1);
-				}
-			}
-			break;
-
-		case 'y':
-			if (optarg) {
-				height = atoi(optarg);
-				if (height > 0) {
-					ws2811->channel[0].count = height * width;
-				} else {
-					printf ("invalid height %d\n", height);
-					exit (-1);
-				}
-			}
-			break;
-
-		case 'x':
-			if (optarg) {
-				width = atoi(optarg);
-				if (width > 0) {
-					ws2811->channel[0].count = height * width;
-				} else {
-					printf ("invalid width %d\n", width);
-					exit (-1);
-				}
-			}
-			break;
-
-		case 's':
-			if (optarg) {
-				if (!strncasecmp("rgb", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_RGB;
-				}
-				else if (!strncasecmp("rbg", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_RBG;
-				}
-				else if (!strncasecmp("grb", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_GRB;
-				}
-				else if (!strncasecmp("gbr", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_GBR;
-				}
-				else if (!strncasecmp("brg", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_BRG;
-				}
-				else if (!strncasecmp("bgr", optarg, 4)) {
-					ws2811->channel[0].strip_type = WS2811_STRIP_BGR;
-				}
-				else if (!strncasecmp("rgbw", optarg, 4)) {
-					ws2811->channel[0].strip_type = SK6812_STRIP_RGBW;
-				}
-				else if (!strncasecmp("grbw", optarg, 4)) {
-					ws2811->channel[0].strip_type = SK6812_STRIP_GRBW;
-				}
-				else {
-					printf ("invalid strip %s\n", optarg);
-					exit (-1);
-				}
-			}
-			break;
-
-		case 'v':
-			fprintf(stderr, "%s version %s\n", argv[0], VERSION);
-			exit(-1);
-
-		case '?':
-			/* getopt_long already reported error? */
-			exit(-1);
-
-		default:
-			exit(-1);
-		}
-	}
-}
-
-
 int main(int argc, char *argv[])
 {
-    ws2811_return_t ret;
+	// Parse arguments function
+	parse_args(argc, argv);
 
-    sprintf(VERSION, "%d.%d.%d", VERSION_MAJOR, VERSION_MINOR, VERSION_MICRO);
+	// The below line has been added to view the transition from 0% to max and back to 0%
+	duty_cycle = 0;
 
-    parseargs(argc, argv, &ledstring);
+	int ret_status = 0;
 
-    matrix = malloc(sizeof(ws2811_led_t) * width * height);
+	test_device_t *test_device = malloc(sizeof(test_device_t));
 
-    setup_handlers();
+	// Pointer to store the hardware version and peripheral base
+	test_device->rpi_hw =  rpi_hw_detect();
 
-    if ((ret = ws2811_init(&ledstring)) != WS2811_SUCCESS)
-    {
-        fprintf(stderr, "ws2811_init failed: %s\n", ws2811_get_return_t_str(ret));
-        return ret;
-    }
+	ret_status = map_registers_pwm(test_device);
+	if (ret_status == -1) {
+		printf("Unable to map registers\n");
+		exit(EXIT_FAILURE);
+	}
+
+	ret_status = check_pin_setup(test_device);
+	if (ret_status == -1) {
+		printf("Pin setup is incorrect\n");
+		goto cleanup;
+	}
+
+	pwm_register_config(test_device);
+
+	set_pwm_max(test_device, 100);
+
+	pwm_set_duty_cycle(test_device);
+
+	enable_pwm(test_device);
 
     while (running)
     {
-        matrix_raise();
-        matrix_bottom();
-        matrix_render();
+		for (int i = 0; i < 10; i++) {
+			pwm_duty_cycle_change(test_device, 10, INCREASE);
+			usleep(200000);
+		}
 
-        if ((ret = ws2811_render(&ledstring)) != WS2811_SUCCESS)
-        {
-            fprintf(stderr, "ws2811_render failed: %s\n", ws2811_get_return_t_str(ret));
-            break;
-        }
-
-        // 15 frames /sec
-        usleep(1000000 / 15);
+		for (int i = 0; i < 10; i++) {
+			pwm_duty_cycle_change(test_device, 10, DECREASE);
+			usleep(200000);
+		}
     }
 
-    if (clear_on_exit) {
-	matrix_clear();
-	matrix_render();
-	ws2811_render(&ledstring);
-    }
+	disable_pwm(test_device);
 
-    ws2811_fini(&ledstring);
+	cleanup: unmap_registers_pwm(test_device);
 
     printf ("\n");
-    return ret;
+    return 0;
 }
