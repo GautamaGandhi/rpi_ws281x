@@ -166,7 +166,7 @@ void parse_args(int argc, char **argv)
 	}
 
 	// Checking if the duty cycle flag was set
-	if (duty_cycle_flag) {
+	if ((duty_cycle_flag) && (d_cycle >= 0 && d_cycle <= 100)) {
 		duty_cycle = d_cycle;
 	} else {
 		duty_cycle = 50; // Default duty cycle is 50%
