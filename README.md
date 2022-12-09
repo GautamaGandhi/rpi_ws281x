@@ -1,3 +1,62 @@
+PWM_TEST
+================
+This repository has been forked from https://github.com/jgarff/rpi_ws281x. This repository implements a simple test for GPIO and PWM in the main.c file. The below changes have been made:
+- The matrix related functionality has been omitted.
+- The setup functionality for the PWM peripheral has been modified to configure it in PWM mode as opposed to Serializer mode
+- Additional Functions have been written in the main.c file that allow setting the PWM limit and duty cycle, altering the duty cycle and functions that club together the use of mapmem for physical address mapping.
+- The main function has been altered to support this PWM peripheral test 
+
+The command line arguments determine the GPIO number and PWM channel to be used as well as the duty cycle for the PWM wave. The test program enables the PWM, GPIO and Clock peripherals and configures the PWM registers in PWM mode. The main contains a while loop that can be terminated by a SIGINT or SIGTERM signal. The duty cycle of the PWM continuously varies from low to high and high to low over the course of the loop. This program can be tested by constructing a basic LED circuit connected to the pin used for PWM to view the changing duty cycles.
+
+**Execution Instructions**
+This program can be compiled using the Makefile and requires root privileges to be executed. The Makefile has been modified so that it can be used with a build system. The forked repository can be added and run as a package on a custom build. The program has to be executed in the following format:
+
+    sudo ./pwm --gpio=<GPIO NUMBER> --channel=<CHANNEL NUMBER> --duty_cycle=<DUTY CYCLE PERCENT> -h
+
+The GPIO NUMBER must be a valid integer corresponding to a GPIO pin with PWM functionality. The CHANNEL NUMBER must be either 0 or 1 to depict the PWM channels. THE DUTY CYCLE PERCENT must be a value between 0 and 100. The -h is a help flag used to display this information. If none of the flags are present the default values taken are GPIO Pin = 18, Channel Number = 0 and Duty Cycle = 50%.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 rpi_ws281x
 ==========
 
